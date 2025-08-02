@@ -43,6 +43,10 @@ device = 'cuda'
 dtype = 'float16'  # P100 doesn't support bfloat16
 compile = False  # Disabled for compatibility
 
+# TensorBoard logging
+tensorboard_log = True
+tensorboard_log_dir = 'runs/3d_parallel_8gpu'
+
 # Checkpointing
 out_dir = 'out_3d_8gpu'
 always_save_checkpoint = True

@@ -117,37 +117,18 @@ def _gather(input_):
     
     last_dim = input_.dim() - 1
     
+    # Ensure input tensor is contiguous
+    if not input_.is_contiguous():
+        input_ = input_.contiguous()
+    
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[get_tensor_model_parallel_rank()] = input_
     
     try:
-        # For gloo backend, all_gather can be problematic with large tensors
-        # Use a workaround for vocabulary parallel operations
-        if input_.numel() > 100000:  # Large tensor (likely lm_head output)
-            # Split into smaller chunks
-            chunk_size = 10000
-            output_chunks = []
-            
-            for i in range(0, input_.shape[-1], chunk_size):
-                end_idx = min(i + chunk_size, input_.shape[-1])
-                chunk = input_[..., i:end_idx]
-                
-                chunk_list = [torch.empty_like(chunk) for _ in range(world_size)]
-                chunk_list[get_tensor_model_parallel_rank()] = chunk
-                
-                torch.distributed.all_gather(chunk_list, chunk, group=get_tensor_model_parallel_group())
-                gathered_chunk = torch.cat(chunk_list, dim=last_dim).contiguous()
-                output_chunks.append(gathered_chunk)
-            
-            output = torch.cat(output_chunks, dim=last_dim).contiguous()
-        else:
-            torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
-            output = torch.cat(tensor_list, dim=last_dim).contiguous()
-        
+        torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
+        output = torch.cat(tensor_list, dim=last_dim).contiguous()
         return output
-    except Exception as e:
-        print(f"[ERROR] _gather failed: {e}")
-        print(f"[DEBUG] Falling back to direct concatenation...")
+    except Exception:
         # Fallback: just return input without gathering (for debugging)
         return input_
 
@@ -329,3 +310,59 @@ class RowParallelLinear(nn.Module):
             output = output_
         
         return output
+
+
+def vocab_parallel_cross_entropy(vocab_parallel_logits, target):
+    """
+    Perform cross entropy loss when logits are split across tensor parallel ranks.
+    
+    Args:
+        vocab_parallel_logits: logits with vocabulary dimension split across ranks
+        target: target token ids (full vocabulary range)
+    
+    Returns:
+        cross entropy loss
+    """
+    # Get tensor parallel info
+    world_size = get_tensor_model_parallel_world_size()
+    rank = get_tensor_model_parallel_rank()
+    
+    if world_size == 1:
+        return F.cross_entropy(vocab_parallel_logits, target, ignore_index=-1)
+    
+    # Calculate vocabulary range for this rank
+    vocab_size = vocab_parallel_logits.size(-1) * world_size
+    vocab_start, vocab_end = _vocab_range_from_global_vocab_size(vocab_size, rank, world_size)
+    
+    # Create mask for targets that belong to this partition
+    target_mask = (target >= vocab_start) & (target < vocab_end)
+    
+    # Create a new target tensor with local indices
+    # For targets not in this partition, we'll use a dummy index (0)
+    local_target = torch.zeros_like(target)
+    local_target[target_mask] = target[target_mask] - vocab_start
+    
+    # Compute loss only for targets in this partition
+    if target_mask.any():
+        # Create logits for valid targets only
+        valid_logits = vocab_parallel_logits[target_mask]
+        valid_targets = local_target[target_mask]
+        
+        # Compute cross entropy loss
+        partition_loss = F.cross_entropy(valid_logits, valid_targets, reduction='sum')
+        partition_count = target_mask.sum().float()
+    else:
+        partition_loss = torch.tensor(0.0, device=vocab_parallel_logits.device, dtype=vocab_parallel_logits.dtype)
+        partition_count = torch.tensor(0.0, device=vocab_parallel_logits.device, dtype=torch.float32)
+    
+    # All-reduce the loss and count across all partitions
+    torch.distributed.all_reduce(partition_loss, group=get_tensor_model_parallel_group())
+    torch.distributed.all_reduce(partition_count, group=get_tensor_model_parallel_group())
+    
+    # Compute final loss (average)
+    if partition_count > 0:
+        loss = partition_loss / partition_count
+    else:
+        loss = partition_loss  # Should be 0
+    
+    return loss

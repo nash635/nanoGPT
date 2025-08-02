@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 
 # Import our 3D parallel components
 from megatron.initialize import initialize_model_parallel, destroy_model_parallel
@@ -37,6 +38,10 @@ wandb_log = False
 wandb_project = 'nanogpt-3d'
 wandb_run_name = 'gpt2-3d'
 
+# tensorboard logging
+tensorboard_log = True
+tensorboard_log_dir = 'runs/3d_parallel_training'
+
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8
@@ -48,6 +53,9 @@ n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0
+bias = False
+# Base vocabulary configuration
+base_vocab_size = 50257  # GPT-2 actual vocabulary size
 bias = False
 
 # 3D parallelism configuration
@@ -78,17 +86,10 @@ compile = False  # Disable for 3D parallelism compatibility
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 # Import config overrides from command line argument
 import sys
-print(f"Debug: sys.argv = {sys.argv}")
-print(f"Debug: Current working directory = {os.getcwd()}")
 if len(sys.argv) > 1:
     config_file = sys.argv[1]
-    print(f"Debug: Trying to load config from {config_file}")
     if os.path.exists(config_file):
-        print(f"Loading config from {config_file}")
         exec(open(config_file).read())
-        print(f"Debug: tensor_model_parallel_size = {globals().get('tensor_model_parallel_size', 'NOT SET')}")
-    else:
-        print(f"Config file {config_file} not found, using defaults")
 elif os.path.exists('configurator.py'):
     exec(open('configurator.py').read())
 
@@ -110,9 +111,8 @@ def setup_distributed():
         world_size = 1
     
     if world_size > 1:
-        # Use gloo backend for better stability with P2P issues
-        backend = os.environ.get('DDP_BACKEND', 'gloo')
-        print(f"Initializing distributed with backend: {backend}")
+        # Use nccl backend for GPU communication
+        backend = os.environ.get('DDP_BACKEND', 'nccl')
         
         # Set timeout to prevent hanging
         dist.init_process_group(
@@ -120,32 +120,24 @@ def setup_distributed():
             timeout=timedelta(seconds=60)
         )
         torch.cuda.set_device(local_rank)
-        print(f"Distributed initialization complete. Rank {rank}/{world_size}")
     
     return rank, local_rank, world_size
 
 
 def get_batch(split, data_dir):
-    """Load a batch of data"""
+    """Generate a small batch of data of inputs X and targets Y"""
+    # Get data parallel info
+    dp_world_size = get_data_parallel_world_size()
+    dp_rank = get_data_parallel_rank()
+    
+    # Calculate batch size per data parallel rank
+    batch_size_per_dp = batch_size // dp_world_size
+    
+    # Load the appropriate file
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    
-    # Adjust batch size for data parallel
-    dp_world_size = get_data_parallel_world_size()
-    dp_rank = get_data_parallel_rank()
-    
-    # Calculate effective batch size per data parallel rank
-    batch_size_per_dp = batch_size // dp_world_size
-    if batch_size_per_dp <= 0:
-        batch_size_per_dp = 1  # Ensure at least 1 sample per rank
-    
-    # Debug print for the first call
-    if not hasattr(get_batch, '_debug_printed'):
-        print(f"get_batch debug: dp_world_size={dp_world_size}, dp_rank={dp_rank}, batch_size_per_dp={batch_size_per_dp}")
-        print(f"Data length: {len(data)}, block_size: {block_size}")
-        get_batch._debug_printed = True
     
     # Generate random indices with error handling
     try:
@@ -157,6 +149,9 @@ def get_batch(split, data_dir):
         x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
         
+        # Clamp target values to be within vocabulary range
+        y = torch.clamp(y, 0, base_vocab_size - 1)
+        
         if device == 'cuda':
             x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         else:
@@ -166,8 +161,6 @@ def get_batch(split, data_dir):
         
     except Exception as e:
         print(f"Error in get_batch: {e}")
-        print(f"dp_world_size={dp_world_size}, dp_rank={dp_rank}, batch_size_per_dp={batch_size_per_dp}")
-        print(f"Data length: {len(data)}, block_size: {block_size}")
         raise
 
 
@@ -211,14 +204,10 @@ def main():
     master_process = rank == 0
     
     # Initialize 3D model parallelism
-    if master_process:
-        print("Initializing 3D model parallelism...")
     initialize_model_parallel(
         tensor_model_parallel_size=tensor_model_parallel_size,
         pipeline_model_parallel_size=pipeline_model_parallel_size
     )
-    if master_process:
-        print("3D model parallelism initialized successfully")
     
     # Calculate tokens per iteration considering 3D parallelism
     data_parallel_size = get_data_parallel_world_size()
@@ -232,6 +221,17 @@ def main():
         print(f"  Total world size: {world_size}")
         print(f"Tokens per iteration: {tokens_per_iter:,}")
         os.makedirs(out_dir, exist_ok=True)
+        
+        # Initialize TensorBoard writer
+        if tensorboard_log:
+            tb_log_dir = os.path.join(tensorboard_log_dir, f"run_{time.strftime('%Y%m%d_%H%M%S')}")
+            os.makedirs(tb_log_dir, exist_ok=True)
+            writer = SummaryWriter(tb_log_dir)
+            print(f"TensorBoard logs will be saved to: {tb_log_dir}")
+        else:
+            writer = None
+    else:
+        writer = None
     
     # Set random seed
     torch.manual_seed(1337 + rank)
@@ -245,15 +245,21 @@ def main():
     # Data loading
     data_dir = os.path.join('..', 'data', dataset)  # Correct path from 3d directory
     if not os.path.exists(os.path.join(data_dir, 'train.bin')):
-        print(f"Data directory {data_dir} not found, trying alternative path...")
         data_dir = os.path.join('data', dataset)
         if not os.path.exists(os.path.join(data_dir, 'train.bin')):
-            raise FileNotFoundError(f"Training data not found in {data_dir}")
+            # Try absolute path
+            data_dir = '/home/jian.sha/nanoGPT/data/openwebtext'
+            if not os.path.exists(os.path.join(data_dir, 'train.bin')):
+                raise FileNotFoundError(f"Training data not found in {data_dir}")
     
     # Model initialization
+    # For tensor parallelism, vocab_size must be divisible by tensor_model_parallel_size
+    # GPT-2 has 50257 tokens, round up to nearest multiple of tensor_model_parallel_size
+    vocab_size = ((base_vocab_size - 1) // tensor_model_parallel_size + 1) * tensor_model_parallel_size
+    
     gptconf = GPTConfig(
         block_size=block_size,
-        vocab_size=50304,  # GPT-2 vocab size
+        vocab_size=vocab_size,
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
@@ -263,9 +269,10 @@ def main():
         pipeline_model_parallel_size=pipeline_model_parallel_size
     )
     
+    if master_process:
+        print(f"Using vocab_size={vocab_size} (rounded up from {base_vocab_size} for tensor parallelism)")
+    
     if init_from == 'scratch':
-        if master_process:
-            print("Initializing a new model from scratch")
         model = ParallelGPT(gptconf)
     else:
         raise NotImplementedError("Resume and pretrained not implemented for 3D parallel model")
@@ -285,7 +292,6 @@ def main():
     
     # Compile model (disabled for now due to compatibility)
     if compile:
-        print("compiling the model... (takes a ~minute)")
         unoptimized_model = model
         model = torch.compile(model)
     
@@ -316,6 +322,12 @@ def main():
         if iter_num % eval_interval == 0 and master_process and iter_num > 0:  # Skip eval at iter_num=0
             losses = estimate_loss(model, data_dir, ctx)
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            
+            # Log to TensorBoard
+            if writer is not None:
+                writer.add_scalar('Loss/Train', losses['train'], iter_num)
+                writer.add_scalar('Loss/Validation', losses['val'], iter_num)
+                writer.add_scalar('Learning_Rate', lr, iter_num)
             
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val']
@@ -377,10 +389,14 @@ def main():
                 mfu = model_for_mfu.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        
-        # Progress check: print a simple indicator every few iterations  
-        if master_process and iter_num > 0 and iter_num % 5 == 0:
-            print(f"[INFO] Completed iteration {iter_num}, starting next...")
+            
+            # Log to TensorBoard
+            if writer is not None:
+                writer.add_scalar('Loss/Train_Step', lossf, iter_num)
+                writer.add_scalar('Performance/Time_per_Step_ms', dt*1000, iter_num)
+                if running_mfu > 0:
+                    writer.add_scalar('Performance/MFU_Percent', running_mfu*100, iter_num)
+                writer.add_scalar('Performance/Tokens_per_Second', tokens_per_iter/dt, iter_num)
         
         iter_num += 1
         local_iter_num += 1
@@ -390,6 +406,10 @@ def main():
             break
     
     # Cleanup
+    if master_process and writer is not None:
+        writer.close()
+        print(f"TensorBoard logs saved to: {tb_log_dir}")
+    
     if world_size > 1:
         destroy_model_parallel()
         dist.destroy_process_group()

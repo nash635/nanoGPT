@@ -265,7 +265,19 @@ class ParallelGPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            
+            # Since lm_head has gather_output=True, logits should be the full vocabulary size
+            # But let's check and handle both cases
+            expected_vocab_size = self.config.vocab_size
+            actual_vocab_size = logits.size(-1)
+            
+            if actual_vocab_size == expected_vocab_size:
+                # Logits are gathered, use regular cross entropy
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                # Logits are still split, use vocab parallel cross entropy
+                from .tensor_parallel import vocab_parallel_cross_entropy
+                loss = vocab_parallel_cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
