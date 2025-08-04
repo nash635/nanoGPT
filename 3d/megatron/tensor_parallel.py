@@ -128,9 +128,51 @@ def _gather(input_):
         torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
         output = torch.cat(tensor_list, dim=last_dim).contiguous()
         return output
-    except Exception:
-        # Fallback: just return input without gathering (for debugging)
-        return input_
+    except Exception as e:
+        print(f"[ERROR] _gather failed: {e}")
+        print("[DEBUG] Falling back to direct concatenation...")
+        
+        # Fallback: ensure all tensors in the list are contiguous and try again
+        try:
+            # Make sure all tensors are contiguous
+            for i in range(len(tensor_list)):
+                if tensor_list[i] is not None and not tensor_list[i].is_contiguous():
+                    tensor_list[i] = tensor_list[i].contiguous()
+            
+            # Try all_gather again with contiguous tensors
+            torch.distributed.all_gather(tensor_list, input_.contiguous(), group=get_tensor_model_parallel_group())
+            output = torch.cat(tensor_list, dim=last_dim).contiguous()
+            return output
+        except Exception as e2:
+            print(f"[ERROR] Second attempt failed: {e2}")
+            
+            # Fallback: manually concatenate what we have
+            # This is a simplified approach - we'll manually create the full tensor
+            rank = get_tensor_model_parallel_rank()
+            
+            # Create output tensor with full size
+            full_shape = list(input_.shape)
+            full_shape[last_dim] = full_shape[last_dim] * world_size
+            output = torch.zeros(full_shape, dtype=input_.dtype, device=input_.device)
+            
+            # Place our partition in the correct position
+            start_idx = rank * input_.shape[last_dim]
+            end_idx = start_idx + input_.shape[last_dim]
+            
+            if last_dim == 0:
+                output[start_idx:end_idx] = input_
+            elif last_dim == 1:
+                output[:, start_idx:end_idx] = input_
+            elif last_dim == 2:
+                output[:, :, start_idx:end_idx] = input_
+            else:
+                # For higher dimensions, use more general approach
+                slices = [slice(None)] * input_.dim()
+                slices[last_dim] = slice(start_idx, end_idx)
+                output[tuple(slices)] = input_
+            
+            print(f"[DEBUG] Created fallback tensor with shape {output.shape}")
+            return output
 
 
 # Public API

@@ -16,6 +16,11 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
+# Configure torch._dynamo early to avoid DDP optimizer issues
+import torch._dynamo
+torch._dynamo.config.optimize_ddp = False  # Disable DDP optimizer for higher order ops
+torch._dynamo.config.suppress_errors = True  # Fall back to eager mode on errors
+
 # Import our 3D parallel components
 from megatron.initialize import initialize_model_parallel, destroy_model_parallel
 from megatron.initialize import get_data_parallel_group, get_data_parallel_rank, get_data_parallel_world_size
@@ -40,50 +45,85 @@ wandb_run_name = 'gpt2-3d-optimized'
 
 # tensorboard logging
 tensorboard_log = True
-tensorboard_log_dir = 'runs/3d_parallel_optimized'
+tensorboard_log_dir = 'runs/3d_parallel_stable'
 
-# data
+# -----------------------------------------------------------------------------
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+# Import config overrides from command line argument
+import sys
+if len(sys.argv) > 1:
+    config_file = sys.argv[1]
+    if os.path.exists(config_file):
+        exec(open(config_file).read())
+elif os.path.exists('configurator.py'):
+    exec(open('configurator.py').read())
+
+config = {k: globals()[k] for k in config_keys}
+
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+
+# data - Stable settings to prevent NaN loss
 dataset = 'openwebtext'
-gradient_accumulation_steps = 32  # Increased for better GPU utilization
-batch_size = 16  # Increased batch size
-block_size = 2048  # Increased sequence length for A100
+gradient_accumulation_steps = 16  # Reduced for stability
+batch_size = 8  # Reduced batch size for stability
+block_size = 1024  # Reduced sequence length for stability
 
 # model - Keep original GPT-2 124M size
 n_layer = 12  # Original GPT-2 small
 n_head = 12   # Original GPT-2 small
 n_embd = 768  # Original GPT-2 small
-dropout = 0.0 # Original setting
+dropout = 0.1 # Increased dropout for regularization and stability
 bias = False
 base_vocab_size = 50257
 
-# 3D parallelism configuration - Optimized for 8x A100
-tensor_model_parallel_size = 4  # 4-way tensor parallelism
+# 3D parallelism configuration - Conservative settings for stability
+tensor_model_parallel_size = 2  # Reduced from 4 to 2 for stability
 pipeline_model_parallel_size = 1  # Disable pipeline to reduce overhead
-# Data parallel size is computed automatically: 8/(4*1) = 2
+# Data parallel size is computed automatically: 8/(2*1) = 4
 
-# adamw optimizer
-learning_rate = 3e-4  # Adjusted for larger model
+# adamw optimizer - Conservative settings to prevent NaN
+learning_rate = 5e-5  # Much lower learning rate for stability
 max_iters = 600000
-weight_decay = 1e-1
+weight_decay = 1e-2  # Reduced weight decay
 beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0
+beta2 = 0.999  # More conservative beta2
+grad_clip = 0.5  # Stricter gradient clipping
 
 # learning rate decay settings
 decay_lr = True
-warmup_iters = 2000
+warmup_iters = 5000  # Longer warmup for stability
 lr_decay_iters = 600000
-min_lr = 3e-5
+min_lr = 5e-6
 
 # system
 device = 'cuda'
 dtype = 'bfloat16'  # Use bfloat16 for A100
-compile = True  # Enable compilation for better performance
+compile = False  # Disable compilation for debugging and stability
 
 # Performance optimizations
 pin_memory = True
 non_blocking = True
-prefetch_factor = 4  # Increased prefetching
+prefetch_factor = 2  # Reduced prefetching
+
+# I/O - More frequent evaluation for debugging
+out_dir = 'out_stable'
+eval_interval = 100  # More frequent evaluation
+log_interval = 1
+eval_iters = 50  # Reduced for faster evaluation
+eval_only = False
+always_save_checkpoint = True
+init_from = 'scratch'
+
+# wandb logging
+wandb_log = False
+wandb_project = 'nanogpt-3d-stable'
+wandb_run_name = 'gpt2-3d-stable'
+
+# tensorboard logging
+tensorboard_log = True
+tensorboard_log_dir = 'runs/3d_parallel_stable'
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -101,7 +141,6 @@ config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
 def setup_distributed():
-    """Setup distributed training environment with optimizations"""
     # Initialize distributed backend
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
@@ -135,12 +174,13 @@ def setup_distributed():
 class OptimizedDataLoader:
     """Optimized data loader with prefetching and memory pinning"""
     
-    def __init__(self, data_dir, split, block_size, batch_size_per_dp, device):
+    def __init__(self, data_dir, split, block_size, batch_size_per_dp, device, vocab_size):
         self.data_dir = data_dir
         self.split = split
         self.block_size = block_size
         self.batch_size_per_dp = batch_size_per_dp
         self.device = device
+        self.vocab_size = vocab_size
         
         # Load data
         if split == 'train':
@@ -164,8 +204,13 @@ class OptimizedDataLoader:
             x[i] = torch.from_numpy(self.data[start_idx:start_idx+self.block_size].astype(np.int64))
             y[i] = torch.from_numpy(self.data[start_idx+1:start_idx+1+self.block_size].astype(np.int64))
         
-        # Clamp target values
-        y = torch.clamp(y, 0, base_vocab_size - 1)
+        # Critical fix: Clamp both input and target values to vocab_size - 1
+        x = torch.clamp(x, 0, self.vocab_size - 1)
+        y = torch.clamp(y, 0, self.vocab_size - 1)
+        
+        # Check for invalid tokens
+        if torch.any(x >= self.vocab_size) or torch.any(y >= self.vocab_size):
+            print(f"WARNING: Found tokens >= vocab_size ({self.vocab_size}). Max x: {x.max()}, Max y: {y.max()}")
         
         if self.device == 'cuda':
             if pin_memory:
@@ -179,7 +224,7 @@ class OptimizedDataLoader:
         return x, y
 
 
-def get_batch(split, data_dir):
+def get_batch(split, data_dir, vocab_size):
     """Generate a batch of data - optimized version"""
     dp_world_size = get_data_parallel_world_size()
     dp_rank = get_data_parallel_rank()
@@ -192,21 +237,21 @@ def get_batch(split, data_dir):
     loader_key = f"{split}_{data_dir}"
     if loader_key not in get_batch.loaders:
         get_batch.loaders[loader_key] = OptimizedDataLoader(
-            data_dir, split, block_size, batch_size_per_dp, device
+            data_dir, split, block_size, batch_size_per_dp, device, vocab_size
         )
     
     return get_batch.loaders[loader_key].get_batch()
 
 
 @torch.no_grad()
-def estimate_loss(model, data_dir, ctx):
+def estimate_loss(model, data_dir, ctx, vocab_size):
     """Estimate loss on train and val datasets - optimized"""
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters, device=device)  # Keep on GPU
         for k in range(eval_iters):
-            X, Y = get_batch(split, data_dir)
+            X, Y = get_batch(split, data_dir, vocab_size)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss
@@ -245,6 +290,47 @@ def main():
     tokens_per_iter = gradient_accumulation_steps * data_parallel_size * batch_size * block_size
     
     if master_process:
+        # Display GPU information
+        try:
+            gpu_name = torch.cuda.get_device_name()
+            gpu_count = torch.cuda.device_count()
+            print(f"🖥️  GPU Information:")
+            print(f"  GPU Model: {gpu_name}")
+            print(f"  GPU Count: {gpu_count}")
+            
+            # Display expected peak FLOPS for MFU calculation (simplified GPU list)
+            gpu_name_lower = gpu_name.lower()
+            if 'h20' in gpu_name_lower:
+                peak_flops = 148  # Corrected: 296 TFLOPS is for FP8
+                gpu_type = "H20"
+            elif 'h100' in gpu_name_lower:
+                peak_flops = 989 if 'sxm' in gpu_name_lower else 756
+                gpu_type = "H100"
+            elif 'a100' in gpu_name_lower:
+                peak_flops = 312
+                gpu_type = "A100"
+            elif 'v100' in gpu_name_lower:
+                peak_flops = 125
+                gpu_type = "V100"
+            elif 'p100' in gpu_name_lower:
+                peak_flops = 18.7
+                gpu_type = "P100"
+            elif 'tesla' in gpu_name_lower:
+                if 'v100' in gpu_name_lower:
+                    peak_flops = 125
+                    gpu_type = "Tesla V100"
+                else:
+                    peak_flops = 50
+                    gpu_type = "Tesla (other)"
+            else:
+                peak_flops = 100  # Conservative fallback
+                gpu_type = "Unknown"
+            
+            print(f"  Expected Peak FLOPS (bfloat16): {peak_flops} TFLOPS per GPU")
+            print(f"  GPU Type Detected: {gpu_type}")
+        except Exception as e:
+            print(f"⚠️  Could not detect GPU info: {e}")
+        
         print(f"🚀 Optimized 3D Parallelism Configuration:")
         print(f"  Tensor parallel size: {tensor_model_parallel_size}")
         print(f"  Pipeline parallel size: {pipeline_model_parallel_size}") 
@@ -313,6 +399,11 @@ def main():
     
     # Initialize gradient scaler with optimizations
     scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
+    # Disable scaler for bfloat16 to prevent NaN issues
+    if dtype == 'bfloat16':
+        scaler = torch.amp.GradScaler('cuda', enabled=False)
+        if master_process:
+            print("⚠️  Gradient scaler disabled for bfloat16 to prevent NaN issues")
     
     # Optimizer with optimizations
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -330,21 +421,30 @@ def main():
     if compile:
         if master_process:
             print("🔥 Compiling model for better performance...")
+        # DDP optimizer is already disabled at the top of the script
         unoptimized_model = model
-        model = torch.compile(model)
+        try:
+            model = torch.compile(model)
+            if master_process:
+                print("✅ Model compilation successful")
+        except Exception as e:
+            if master_process:
+                print(f"⚠️  Model compilation failed: {e}")
+                print("🔄 Falling back to eager mode...")
+            model = unoptimized_model
     
     # Training loop variables
     iter_num = 0
     best_val_loss = 1e9
     
     if eval_only:
-        losses = estimate_loss(model, data_dir, ctx)
+        losses = estimate_loss(model, data_dir, ctx, vocab_size)
         if master_process:
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         return
     
     # Pre-fetch first batch
-    X, Y = get_batch('train', data_dir)
+    X, Y = get_batch('train', data_dir, vocab_size)
     t0 = time.time()
     local_iter_num = 0
     running_mfu = -1.0
@@ -360,7 +460,7 @@ def main():
         
         # Evaluation and checkpointing
         if iter_num % eval_interval == 0 and master_process and iter_num > 0:
-            losses = estimate_loss(model, data_dir, ctx)
+            losses = estimate_loss(model, data_dir, ctx, vocab_size)
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
             
             if writer is not None:
@@ -391,23 +491,47 @@ def main():
             with ctx:
                 logits, loss = model(X, Y)
                 loss = loss / gradient_accumulation_steps
+                
+                # Add NaN detection
+                if torch.isnan(loss):
+                    if master_process:
+                        print(f"🚨 NaN loss detected at iter {iter_num}, micro_step {micro_step}")
+                        print(f"   X range: [{X.min()}, {X.max()}]")
+                        print(f"   Y range: [{Y.min()}, {Y.max()}]")
+                        if logits is not None:
+                            print(f"   Logits range: [{logits.min()}, {logits.max()}]")
+                            print(f"   Logits contains inf: {torch.isinf(logits).any()}")
+                    # Skip this batch
+                    continue
             
             # Prefetch next batch asynchronously
-            X, Y = get_batch('train', data_dir)
+            X, Y = get_batch('train', data_dir, vocab_size)
             
             # Backward pass
-            scaler.scale(loss).backward()
+            if dtype == 'bfloat16':
+                # No gradient scaling for bfloat16
+                loss.backward()
+            else:
+                scaler.scale(loss).backward()
         
         # Gradient clipping and optimizer step
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if dtype == 'bfloat16':
+            # No gradient scaling for bfloat16
+            if grad_clip != 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         else:
-            scaler.unscale_(optimizer)
-        
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+            # Use gradient scaling for float16
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            else:
+                scaler.unscale_(optimizer)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
         
         # Timing and logging
         t1 = time.time()

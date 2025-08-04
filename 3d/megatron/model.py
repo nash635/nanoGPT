@@ -246,6 +246,11 @@ class ParallelGPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         
+        # Validate input tokens are within vocabulary range
+        if torch.any(idx >= self.config.vocab_size) or torch.any(idx < 0):
+            print(f"WARNING: Input tokens out of range [0, {self.config.vocab_size}). Range: [{idx.min()}, {idx.max()}]")
+            idx = torch.clamp(idx, 0, self.config.vocab_size - 1)
+        
         # Always process embeddings for tensor parallelism (no pipeline for 2 GPUs)
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
         
@@ -263,8 +268,22 @@ class ParallelGPT(nn.Module):
         x = self.transformer.ln_f(x)
         
         if targets is not None:
+            # Validate target tokens are within vocabulary range
+            if torch.any(targets >= self.config.vocab_size) or torch.any(targets < 0):
+                print(f"WARNING: Target tokens out of range [0, {self.config.vocab_size}). Range: [{targets.min()}, {targets.max()}]")
+                targets = torch.clamp(targets, 0, self.config.vocab_size - 1)
+            
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            
+            # Check for NaN or inf in logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"ERROR: NaN or inf detected in logits!")
+                print(f"  Logits shape: {logits.shape}")
+                print(f"  NaN count: {torch.isnan(logits).sum()}")
+                print(f"  Inf count: {torch.isinf(logits).sum()}")
+                # Return a safe loss to prevent training crash
+                return logits, torch.tensor(float('inf'), device=device, dtype=logits.dtype)
             
             # Since lm_head has gather_output=True, logits should be the full vocabulary size
             # But let's check and handle both cases
@@ -377,7 +396,10 @@ class ParallelGPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        """ 
+        Estimate model flops utilization (MFU) in units of GPU bfloat16 peak FLOPS 
+        Supports A100, H100, H20 and other GPUs with automatic detection
+        """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -386,10 +408,63 @@ class ParallelGPT(nn.Module):
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
+        
+        # Get GPU-specific peak FLOPS for bfloat16
+        def get_gpu_peak_flops():
+            try:
+                gpu_name = torch.cuda.get_device_name().lower()
+                
+                if 'h20' in gpu_name:
+                    # H20: ~148 TFLOPS bfloat16 (296 TFLOPS is for FP8, bfloat16 is roughly half)
+                    return 148e12
+                elif 'h100' in gpu_name:
+                    # H100 SXM: ~989 TFLOPS bfloat16, PCIe: ~756 TFLOPS
+                    if 'sxm' in gpu_name:
+                        return 989e12
+                    else:
+                        return 756e12  # Conservative estimate for PCIe
+                elif 'a100' in gpu_name:
+                    # A100: ~312 TFLOPS bfloat16 (40GB/80GB similar)
+                    return 312e12
+                elif 'v100' in gpu_name:
+                    # V100: ~125 TFLOPS fp16 (no native bfloat16)
+                    return 125e12
+                elif 'p100' in gpu_name:
+                    # P100: ~18.7 TFLOPS fp16 (no native bfloat16)
+                    return 18.7e12
+                elif 'tesla' in gpu_name:
+                    # Handle other Tesla cards
+                    if 'v100' in gpu_name:
+                        return 125e12  # Tesla V100: same as above
+                    else:
+                        return 50e12  # Conservative fallback for other Tesla
+                else:
+                    # Unknown GPU, use conservative fallback
+                    print(f"Unknown GPU: {gpu_name}, using conservative FLOPS estimate")
+                    return 100e12
+                    
+            except Exception as e:
+                print(f"Error detecting GPU: {e}, using fallback FLOPS")
+                return 100e12  # Conservative fallback
+        
+        # Express our flops throughput as ratio of GPU peak flops
+        flops_achieved = flops_per_iter * (1.0/dt)  # per second
+        flops_promised = get_gpu_peak_flops()
+        
+        # Account for tensor parallelism - we're measuring across all GPUs
+        # but each GPU only does a fraction of the computation
+        tensor_parallel_size = getattr(cfg, 'tensor_model_parallel_size', 1)
+        if tensor_parallel_size > 1:
+            # Each GPU in tensor parallel group does 1/tp_size of the computation
+            # So total achieved flops across all GPUs should be divided by tp_size
+            # to get per-GPU utilization
+            from .initialize import get_tensor_model_parallel_world_size
+            actual_tp_size = get_tensor_model_parallel_world_size()
+            flops_achieved_per_gpu = flops_achieved / actual_tp_size
+        else:
+            flops_achieved_per_gpu = flops_achieved
+        
+        mfu = flops_achieved_per_gpu / flops_promised
         return mfu
 
     @torch.no_grad()
