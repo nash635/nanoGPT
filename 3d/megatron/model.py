@@ -399,6 +399,11 @@ class ParallelGPT(nn.Module):
         """ 
         Estimate model flops utilization (MFU) in units of GPU bfloat16 peak FLOPS 
         Supports A100, H100, H20 and other GPUs with automatic detection
+        
+        For 3D parallelism:
+        - fwdbwd_per_iter = batch_size * gradient_accumulation_steps
+        - This represents the total tokens processed per iteration
+        - Each GPU processes a subset based on tensor/pipeline parallelism
         """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
@@ -407,6 +412,8 @@ class ParallelGPT(nn.Module):
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
+        
+        # Total FLOPS for the iteration (across all parallel dimensions)
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         
         # Get GPU-specific peak FLOPS for bfloat16
@@ -451,18 +458,35 @@ class ParallelGPT(nn.Module):
         flops_achieved = flops_per_iter * (1.0/dt)  # per second
         flops_promised = get_gpu_peak_flops()
         
-        # Account for tensor parallelism - we're measuring across all GPUs
-        # but each GPU only does a fraction of the computation
-        tensor_parallel_size = getattr(cfg, 'tensor_model_parallel_size', 1)
-        if tensor_parallel_size > 1:
-            # Each GPU in tensor parallel group does 1/tp_size of the computation
-            # So total achieved flops across all GPUs should be divided by tp_size
-            # to get per-GPU utilization
-            from .initialize import get_tensor_model_parallel_world_size
-            actual_tp_size = get_tensor_model_parallel_world_size()
-            flops_achieved_per_gpu = flops_achieved / actual_tp_size
-        else:
-            flops_achieved_per_gpu = flops_achieved
+        # For 3D parallelism, we need to calculate per-GPU FLOPS correctly
+        # Total computation is distributed across multiple dimensions:
+        # - Tensor parallel: each GPU handles part of tensors
+        # - Pipeline parallel: each GPU handles subset of layers  
+        # - Data parallel: each GPU handles subset of batch
+        
+        try:
+            from .initialize import (
+                get_tensor_model_parallel_world_size,
+                get_pipeline_model_parallel_world_size,
+                get_data_parallel_world_size
+            )
+            tp_size = get_tensor_model_parallel_world_size()
+            pp_size = get_pipeline_model_parallel_world_size() 
+            dp_size = get_data_parallel_world_size()
+            
+            # Each GPU does 1/tp_size of tensor computation per token
+            # Each GPU does 1/pp_size of layers (already accounted in N)
+            # Each GPU does 1/dp_size of batch (already accounted in fwdbwd_per_iter)
+            
+            # The key insight: only tensor parallelism affects per-GPU FLOPS
+            # Pipeline and data parallelism change what each GPU computes, 
+            # but don't change the FLOPS per unit of work
+            flops_achieved_per_gpu = flops_achieved / tp_size
+            
+        except ImportError:
+            # Fallback for non-parallel case
+            tensor_parallel_size = getattr(cfg, 'tensor_model_parallel_size', 1) 
+            flops_achieved_per_gpu = flops_achieved / max(tensor_parallel_size, 1)
         
         mfu = flops_achieved_per_gpu / flops_promised
         return mfu
