@@ -389,10 +389,55 @@ def main():
     if master_process:
         print(f"🔧 Using vocab_size={vocab_size} (rounded up from {base_vocab_size} for tensor parallelism)")
     
+    # Initialize iter_num and best_val_loss
+    iter_num = 0
+    best_val_loss = 1e9
+    
     if init_from == 'scratch':
         model = ParallelGPT(gptconf)
+    elif init_from == 'resume':
+        # Resume from checkpoint
+        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+        if master_process:
+            print(f"🔄 Resuming training from {ckpt_path}")
+        
+        if not os.path.exists(ckpt_path):
+            if master_process:
+                print(f"❌ Checkpoint not found: {ckpt_path}")
+                print("   Available files in out_dir:")
+                if os.path.exists(out_dir):
+                    for f in os.listdir(out_dir):
+                        print(f"     {f}")
+                else:
+                    print(f"     Directory {out_dir} does not exist")
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        
+        # Load model state
+        model = ParallelGPT(gptconf)
+        
+        # Get the model state dict, handling DDP wrapper
+        model_state_dict = checkpoint['model']
+        
+        # Load model weights
+        try:
+            model.load_state_dict(model_state_dict, strict=True)
+            if master_process:
+                print("✅ Model state loaded successfully")
+        except Exception as e:
+            if master_process:
+                print(f"⚠️  Model state loading failed, trying without strict mode: {e}")
+            model.load_state_dict(model_state_dict, strict=False)
+        
+        # Load training state
+        iter_num = checkpoint.get('iter_num', 0)
+        best_val_loss = checkpoint.get('best_val_loss', 1e9)
+        
+        if master_process:
+            print(f"✅ Resumed from iteration {iter_num}, best_val_loss: {best_val_loss:.4f}")
     else:
-        raise NotImplementedError("Resume and pretrained not implemented for 3D parallel model")
+        raise NotImplementedError(f"init_from='{init_from}' not implemented for 3D parallel model")
     
     # Move model to device
     model.to(device)
@@ -407,6 +452,17 @@ def main():
     
     # Optimizer with optimizations
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+    # Load optimizer state if resuming
+    if init_from == 'resume' and 'optimizer' in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            if master_process:
+                print("✅ Optimizer state loaded successfully")
+        except Exception as e:
+            if master_process:
+                print(f"⚠️  Failed to load optimizer state: {e}")
+                print("   Continuing with fresh optimizer state")
     
     # Wrap with DDP for data parallelism
     if data_parallel_size > 1:
@@ -433,9 +489,7 @@ def main():
                 print("🔄 Falling back to eager mode...")
             model = unoptimized_model
     
-    # Training loop variables
-    iter_num = 0
-    best_val_loss = 1e9
+    # Training loop variables (iter_num and best_val_loss already set in resume logic)
     
     if eval_only:
         losses = estimate_loss(model, data_dir, ctx, vocab_size)
